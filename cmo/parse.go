@@ -1,25 +1,50 @@
 package cmo
 
 import (
+	"bytes"
 	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/html"
 )
 
-var (
-	pdfHrefRE = regexp.MustCompile(`(?i)href="([^"]+\.pdf)"`)
-	yearRE    = regexp.MustCompile(`(\d{4})`)
-)
+var yearRE = regexp.MustCompile(`(\d{4})`)
 
-// extractPDFLinks returns all PDF href values found in body.
+// extractPDFLinks returns all PDF href values found in body using the
+// golang.org/x/net/html tokenizer. Only href attributes on <a> tags that
+// end with ".pdf" (case-insensitive) are returned.
 func extractPDFLinks(body []byte) []string {
-	var out []string
-	for _, m := range pdfHrefRE.FindAllSubmatch(body, -1) {
-		out = append(out, string(m[1]))
+	var links []string
+	z := html.NewTokenizer(bytes.NewReader(body))
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			break
+		}
+		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
+			continue
+		}
+		name, hasAttr := z.TagName()
+		if !hasAttr || string(name) != "a" {
+			continue
+		}
+		for {
+			key, val, more := z.TagAttr()
+			if string(key) == "href" {
+				s := string(val)
+				if strings.HasSuffix(strings.ToLower(s), ".pdf") {
+					links = append(links, s)
+				}
+			}
+			if !more {
+				break
+			}
+		}
 	}
-	return out
+	return links
 }
 
 // isCJMO reports whether the filename belongs to the Canadian Junior
@@ -52,6 +77,9 @@ func classifyURL(rawURL string) (year int, competition, docType string) {
 		return 0, "", ""
 	}
 	y, _ := strconv.Atoi(m)
+	if y < 1969 || y > 2030 {
+		return 0, "", ""
+	}
 
 	if isCJMO(base) {
 		competition = "CJMO"
@@ -100,12 +128,14 @@ func buildEditions(urls []string) []Edition {
 	}
 
 	// Sort descending by year, then CMO before CJMO within same year.
+	// "CMO" > "CJMO" lexicographically (M > J), so descending comp sort
+	// puts CMO first.
 	sort.Slice(order, func(i, j int) bool {
 		ki, kj := order[i], order[j]
 		if ki.year != kj.year {
 			return ki.year > kj.year
 		}
-		return ki.competition > kj.competition // "CMO" > "CJMO" (M > J)
+		return ki.competition > kj.competition // "CMO" > "CJMO"
 	})
 
 	out := make([]Edition, 0, len(order))
