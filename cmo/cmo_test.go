@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,5 +175,116 @@ func TestEditionsFiltersCMO(t *testing.T) {
 	}
 	if len(cmoOnly) != 2 {
 		t.Errorf("want 2 CMO editions from mock, got %d", len(cmoOnly))
+	}
+}
+
+// TestEditionsRetriesExhausted verifies that the client returns an error when
+// all retry attempts are exhausted.
+func TestEditionsRetriesExhausted(t *testing.T) {
+	var hits int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	c.HTTP = &http.Client{Timeout: 10 * time.Second}
+	c.Retries = 2
+
+	_, err := c.Get(context.Background(), ts.URL)
+	if err == nil {
+		t.Fatal("expected error after retries exhausted, got nil")
+	}
+	if hits != 3 { // 1 initial + 2 retries
+		t.Errorf("server hit %d times, want 3", hits)
+	}
+}
+
+// TestEditionsContextCancel verifies that a cancelled context stops the request
+// promptly.
+func TestEditionsContextCancel(t *testing.T) {
+	ready := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(ready)
+		// Block for longer than the test will wait.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := newTestClient(ts)
+	c.HTTP = &http.Client{Timeout: 10 * time.Second}
+	c.Rate = 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.Get(ctx, ts.URL)
+		errCh <- err
+	}()
+
+	// Wait until the server has received the request, then cancel.
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never received request")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("expected error after context cancel, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Get did not return after context cancel")
+	}
+}
+
+// TestEditionsURLsAssigned verifies that ProblemsURL and SolutionsURL are set
+// correctly for each edition in the mock HTML.
+func TestEditionsURLsAssigned(t *testing.T) {
+	links := extractPDFLinks([]byte(mockHTML))
+	eds := buildEditions(links)
+
+	// Find 2026 CMO.
+	var cmo2026 *Edition
+	for i := range eds {
+		if eds[i].Year == 2026 && eds[i].Competition == "CMO" {
+			cmo2026 = &eds[i]
+			break
+		}
+	}
+	if cmo2026 == nil {
+		t.Fatal("2026 CMO edition not found")
+	}
+	if !strings.HasSuffix(cmo2026.ProblemsURL, "CMO2026-problems.pdf") {
+		t.Errorf("ProblemsURL = %q, want suffix CMO2026-problems.pdf", cmo2026.ProblemsURL)
+	}
+	if !strings.HasSuffix(cmo2026.SolutionsURL, "CMO2026-solutions.pdf") {
+		t.Errorf("SolutionsURL = %q, want suffix CMO2026-solutions.pdf", cmo2026.SolutionsURL)
+	}
+}
+
+// TestEditionsMissingSolutions verifies that an edition with only a problems
+// link has an empty SolutionsURL.
+func TestEditionsMissingSolutions(t *testing.T) {
+	onlyProblems := `<!DOCTYPE html><html><body>
+<a href="https://cms.math.ca/wp-content/uploads/2019/07/exam1969.pdf">1969 CMO</a>
+</body></html>`
+	links := extractPDFLinks([]byte(onlyProblems))
+	eds := buildEditions(links)
+	if len(eds) != 1 {
+		t.Fatalf("want 1 edition, got %d", len(eds))
+	}
+	if eds[0].SolutionsURL != "" {
+		t.Errorf("SolutionsURL = %q, want empty string", eds[0].SolutionsURL)
+	}
+	if eds[0].ProblemsURL == "" {
+		t.Error("ProblemsURL should not be empty")
 	}
 }
